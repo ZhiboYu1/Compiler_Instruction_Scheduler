@@ -420,6 +420,15 @@ public class Parser {
             curOp = curOp.getNext();
         }
     }
+    /**
+     * Parse, rename (VR), then run the scheduler and print scheduled output.
+     */
+    public void parseRenameAndSchedule(){
+        parse();
+        renameIR();
+        Scheduler scheduler = new Scheduler(this.IRHead.getNext());
+        scheduler.printSchedule();
+    }
     
     public static void main(String[] args) {
         try {
