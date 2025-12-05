@@ -24,10 +24,21 @@ public class Scheduler {
         this.head = head;
     }
 
+    private enum EdgeType { FLOW, CONFLICT, SERIALIZATION }
+
+    private static class Edge {
+        Node target;
+        EdgeType type;
+        Edge(Node target, EdgeType type) {
+            this.target = target;
+            this.type = type;
+        }
+    }
+
     private static class Node {
         OpRecord op;
-        List<Node> outs = new ArrayList<>();
-        List<Node> ins = new ArrayList<>();
+        List<Edge> outs = new ArrayList<>();  // edges TO successors
+        List<Edge> ins = new ArrayList<>();   // edges FROM predecessors
         int latency = 1; // intrinsic latency
         int totalLatency = -1; // priority
         Status status = Status.NOT_READY;
@@ -95,8 +106,8 @@ public class Scheduler {
                 if (lastDef.containsKey(reg)) {
                     int defIdx = lastDef.get(reg);
                     Node defNode = nodeOf.get(ops.get(defIdx));
-                    defNode.outs.add(curNode);
-                    curNode.ins.add(defNode);
+                    defNode.outs.add(new Edge(curNode, EdgeType.FLOW));
+                    curNode.ins.add(new Edge(defNode, EdgeType.FLOW));
                 }
             }
 
@@ -105,51 +116,81 @@ public class Scheduler {
                 if (lastDef.containsKey(reg)) {
                     int prevDefIdx = lastDef.get(reg);
                     Node prevDefNode = nodeOf.get(ops.get(prevDefIdx));
-                    prevDefNode.outs.add(curNode);
-                    curNode.ins.add(prevDefNode);
+                    prevDefNode.outs.add(new Edge(curNode, EdgeType.FLOW));
+                    curNode.ins.add(new Edge(prevDefNode, EdgeType.FLOW));
                 }
                 // Update last definition
                 lastDef.put(reg, i);
             }
         }
 
-        // Add memory dependencies separately
+        // Add memory dependencies based on Lab3 DG Script Slide 16 table
         for (int j = 0; j < n; j++) {
-            for (int i = j + 1; i < n; i++) {
-                boolean dep = false;
+            Opcode opj = ops.get(j).getOpCode();
+            if (opj != Opcode.load && opj != Opcode.store && opj != Opcode.output) continue;
 
-                // memory dependence handling: be conservative for stores, but allow
-                // load-load reordering when there is no intervening store.
-                Opcode opj = ops.get(j).getOpCode();
+            for (int i = j + 1; i < n; i++) {
                 Opcode opi = ops.get(i).getOpCode();
+                if (opi != Opcode.load && opi != Opcode.store && opi != Opcode.output) continue;
+
+                EdgeType edgeType = null;
+                boolean createEdge = false;
+
+                // Check if addresses are provably different
+                Integer addrJ = getMemoryAddressConstant(ops.get(j));
+                Integer addrI = getMemoryAddressConstant(ops.get(i));
+                boolean samAddr = (addrJ != null && addrI != null && addrJ.equals(addrI));
+                boolean diffAddr = (addrJ != null && addrI != null && !addrJ.equals(addrI));
+
+                // Apply the dependency table from DG Script Slide 16
                 if (opj == Opcode.load && opi == Opcode.load) {
-                    // if no store occurs between j and i, allow reordering of loads
-                    boolean storeBetween = false;
-                    for (int k = j+1; k < i; k++) {
-                        Opcode ok = ops.get(k).getOpCode();
-                        if (ok == Opcode.store) { storeBetween = true; break; }
+                    // Load → Load: independent in all cases
+                    createEdge = false;
+                } else if (opj == Opcode.load && opi == Opcode.store) {
+                    // Load → Store: SERIALIZATION (WAR) unless different addresses
+                    if (!diffAddr) {
+                        createEdge = true;
+                        edgeType = EdgeType.SERIALIZATION;
                     }
-                    if (storeBetween) dep = true; // conservative if a store exists in between
-                } else if (opj == Opcode.load || opj == Opcode.store || opi == Opcode.load || opi == Opcode.store) {
-                    // For pairs involving a store, require serialization unless both addresses are constant and different
-                    Integer addrJ = getMemoryAddressConstant(ops.get(j));
-                    Integer addrI = getMemoryAddressConstant(ops.get(i));
-                    if (addrJ != null && addrI != null && !addrJ.equals(addrI)) {
-                        // different constant addresses -> no dependency
-                        dep = false;
-                    } else {
-                        dep = true;
+                } else if (opj == Opcode.load && opi == Opcode.output) {
+                    // Load → Output: independent
+                    createEdge = false;
+                } else if (opj == Opcode.store && opi == Opcode.load) {
+                    // Store → Load: CONFLICT (RAW) unless different addresses
+                    if (!diffAddr) {
+                        createEdge = true;
+                        edgeType = EdgeType.CONFLICT;
                     }
+                } else if (opj == Opcode.store && opi == Opcode.store) {
+                    // Store → Store: SERIALIZATION (WAW) unless different addresses
+                    if (!diffAddr) {
+                        createEdge = true;
+                        edgeType = EdgeType.SERIALIZATION;
+                    }
+                } else if (opj == Opcode.store && opi == Opcode.output) {
+                    // Store → Output: CONFLICT (RAW) unless different addresses
+                    if (!diffAddr) {
+                        createEdge = true;
+                        edgeType = EdgeType.CONFLICT;
+                    }
+                } else if (opj == Opcode.output && opi == Opcode.load) {
+                    // Output → Load: independent
+                    createEdge = false;
+                } else if (opj == Opcode.output && opi == Opcode.store) {
+                    // Output → Store: SERIALIZATION (WAR) always
+                    createEdge = true;
+                    edgeType = EdgeType.SERIALIZATION;
+                } else if (opj == Opcode.output && opi == Opcode.output) {
+                    // Output → Output: SERIALIZATION (WAW) always
+                    createEdge = true;
+                    edgeType = EdgeType.SERIALIZATION;
                 }
 
-                if (dep) {
-                    // Standard forward edges: j (earlier) -> i (later)
-                    // ins = predecessors that must complete first
-                    // outs = successors that depend on this
+                if (createEdge) {
                     Node earlier = nodeOf.get(ops.get(j));
                     Node later = nodeOf.get(ops.get(i));
-                    earlier.outs.add(later);  // earlier's successors
-                    later.ins.add(earlier);   // later's predecessors
+                    earlier.outs.add(new Edge(later, edgeType));
+                    later.ins.add(new Edge(earlier, edgeType));
                 }
             }
         }
@@ -193,21 +234,71 @@ public class Scheduler {
 
             // Check if operations that depend on retired ops can become ready
             for (Node retired : retiring) {
-                for (Node successor : retired.outs) {
+                for (Edge outEdge : retired.outs) {
+                    Node successor = outEdge.target;
                     if (successor.status != Status.NOT_READY) continue;
 
-                    // Check if ALL of successor's predecessors (ins) are retired
-                    boolean allPredecessorsRetired = true;
-                    for (Node pred : successor.ins) {
-                        if (pred.status != Status.RETIRED) {
-                            allPredecessorsRetired = false;
+                    // Check if ALL of successor's predecessors are satisfied
+                    // FLOW and CONFLICT edges: wait for RETIRED
+                    // SERIALIZATION edges: satisfied when operation issues (1 cycle)
+                    boolean allDependenciesSatisfied = true;
+                    for (Edge inEdge : successor.ins) {
+                        Node pred = inEdge.target;
+                        if (pred.status == Status.NOT_READY) {
+                            allDependenciesSatisfied = false;
                             break;
                         }
+                        // For FLOW and CONFLICT edges, must wait for RETIRED
+                        if ((inEdge.type == EdgeType.FLOW || inEdge.type == EdgeType.CONFLICT) &&
+                            pred.status != Status.RETIRED) {
+                            allDependenciesSatisfied = false;
+                            break;
+                        }
+                        // For SERIALIZATION edges, ACTIVE or RETIRED is sufficient (early release)
                     }
 
-                    if (allPredecessorsRetired) {
+                    if (allDependenciesSatisfied) {
                         successor.status = Status.READY;
                         ready.offer(new NodeWithIndex(successor, nodeIndex.get(successor)));
+                    }
+                }
+            }
+
+            // EARLY RELEASE: Check for operations with serialization dependencies on ACTIVE operations
+            // This implements Step 4 from the scheduling algorithm
+            for (List<Node> activeOps : active.values()) {
+                for (Node activeNode : activeOps) {
+                    // Only memory ops can have serial successors
+                    Opcode opc = activeNode.op.getOpCode();
+                    if (opc != Opcode.load && opc != Opcode.store && opc != Opcode.output) continue;
+
+                    for (Edge outEdge : activeNode.outs) {
+                        if (outEdge.type != EdgeType.SERIALIZATION) continue;
+
+                        Node successor = outEdge.target;
+                        if (successor.status != Status.NOT_READY) continue;
+
+                        // Check if ALL other dependencies are satisfied
+                        boolean allOtherDependenciesSatisfied = true;
+                        for (Edge inEdge : successor.ins) {
+                            Node pred = inEdge.target;
+                            if (pred == activeNode) continue; // Skip the serial edge we're releasing
+
+                            if (pred.status == Status.NOT_READY) {
+                                allOtherDependenciesSatisfied = false;
+                                break;
+                            }
+                            if ((inEdge.type == EdgeType.FLOW || inEdge.type == EdgeType.CONFLICT) &&
+                                pred.status != Status.RETIRED) {
+                                allOtherDependenciesSatisfied = false;
+                                break;
+                            }
+                        }
+
+                        if (allOtherDependenciesSatisfied) {
+                            successor.status = Status.READY;
+                            ready.offer(new NodeWithIndex(successor, nodeIndex.get(successor)));
+                        }
                     }
                 }
             }
@@ -284,8 +375,8 @@ public class Scheduler {
     private int computeTotalLatency(Node n) {
         if (n.totalLatency != -1) return n.totalLatency;
         int maxChild = 0;
-        for (Node c : n.outs) {
-            int v = computeTotalLatency(c);
+        for (Edge e : n.outs) {
+            int v = computeTotalLatency(e.target);
             if (v > maxChild) maxChild = v;
         }
         n.totalLatency = n.latency + maxChild;
