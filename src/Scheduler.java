@@ -50,7 +50,7 @@ public class Scheduler {
             nodes.add(n);
         }
 
-        // compute data edges (RAW/WAW/WAR) using VRs
+        // compute data edges (RAW/WAW/WAR) using VRs (or SRs if VR not available)
         List<Set<Integer>> defs = new ArrayList<>();
         List<Set<Integer>> uses = new ArrayList<>();
         for (OpRecord op : ops) {
@@ -61,13 +61,19 @@ public class Scheduler {
                 Opcode opc = op.getOpCode();
                 if (opc != Opcode.store) {
                     Operand def = operands.get(operands.size() - 1);
-                    if (def != null && def.isRegister()) d.add(def.getVR());
+                    if (def != null && def.isRegister()) {
+                        int reg = def.getVR() != -1 ? def.getVR() : def.getSR();
+                        d.add(reg);
+                    }
                 }
                 int upto = operands.size();
                 if (opc != Opcode.store && operands.size() > 0) upto = operands.size() - 1;
                 for (int i = 0; i < upto; i++) {
                     Operand use = operands.get(i);
-                    if (use != null && use.isRegister()) u.add(use.getVR());
+                    if (use != null && use.isRegister()) {
+                        int reg = use.getVR() != -1 ? use.getVR() : use.getSR();
+                        u.add(reg);
+                    }
                 }
             }
             defs.add(d); uses.add(u);
@@ -78,17 +84,23 @@ public class Scheduler {
             nodeOf.get(ops.get(i));
         }
 
-        // create edges from earlier to later when dependency detected
+        // Create dependency edges
         for (int j = 0; j < n; j++) {
             for (int i = j + 1; i < n; i++) {
                 boolean dep = false;
                 Set<Integer> defj = defs.get(j);
                 Set<Integer> usei = uses.get(i);
-                Set<Integer> defi = defs.get(i);
-                for (Integer d : defj) if (usei.contains(d)) { dep = true; break; }
-                if (!dep) {
-                    for (Integer d : defi) if (defj.contains(d)) { dep = true; break; }
+
+                // RAW (Read-After-Write): j defines a register that i uses
+                for (Integer d : defj) {
+                    if (usei.contains(d)) {
+                        dep = true;
+                        break;
+                    }
                 }
+
+                // Note: We skip WAW and WAR dependencies when using SRs (unrenamed code)
+                // because in-order issue automatically handles them
                 if (!dep) {
                     // memory dependence handling: be conservative for stores, but allow
                     // load-load reordering when there is no intervening store.
@@ -115,10 +127,13 @@ public class Scheduler {
                     }
                 }
                 if (dep) {
-                    Node a = nodeOf.get(ops.get(j));
-                    Node b = nodeOf.get(ops.get(i));
-                    a.outs.add(b);
-                    b.ins.add(a);
+                    // Standard forward edges: j (earlier) -> i (later)
+                    // ins = predecessors that must complete first
+                    // outs = successors that depend on this
+                    Node earlier = nodeOf.get(ops.get(j));
+                    Node later = nodeOf.get(ops.get(i));
+                    earlier.outs.add(later);  // earlier's successors
+                    later.ins.add(earlier);   // later's predecessors
                 }
             }
         }
@@ -134,6 +149,7 @@ public class Scheduler {
             if (c != 0) return c;
             return Integer.compare(a.idx, b.idx);
         });
+        // Initial ready set: operations with no predecessors (ins empty)
         for (int i = 0; i < nodes.size(); i++) {
             if (nodes.get(i).ins.isEmpty()) {
                 nodes.get(i).status = Status.READY;
@@ -141,14 +157,14 @@ public class Scheduler {
             }
         }
 
+        // mapping node -> original index for stable tie-breaks
+        Map<Node, Integer> nodeIndex = new HashMap<>();
+        for (int i = 0; i < nodes.size(); i++) nodeIndex.put(nodes.get(i), i);
+
         List<String> outLines = new ArrayList<>();
         int cycle = 1;
         Map<Integer, List<Node>> active = new HashMap<>(); // removalCycle -> nodes
         int scheduledCount = 0;
-
-        // mapping node -> original index for stable tie-breaks
-        Map<Node, Integer> nodeIndex = new HashMap<>();
-        for (int i = 0; i < nodes.size(); i++) nodeIndex.put(nodes.get(i), i);
 
         while (!ready.isEmpty() || !active.isEmpty()) {
             // retire nodes whose removal cycle == cycle
@@ -159,50 +175,79 @@ public class Scheduler {
             }
             if (active.containsKey(cycle)) active.remove(cycle);
 
-            // add newly-ready nodes whose predecessors retired
-            for (Node nd : nodes) {
-                if (nd.status == Status.NOT_READY) {
-                    boolean readyAll = true;
-                    for (Node p : nd.ins) if (p.status != Status.RETIRED) { readyAll = false; break; }
-                    if (readyAll) { nd.status = Status.READY; ready.offer(new NodeWithIndex(nd, nodes.indexOf(nd))); }
+            // Check if operations that depend on retired ops can become ready
+            for (Node retired : retiring) {
+                for (Node successor : retired.outs) {
+                    if (successor.status != Status.NOT_READY) continue;
+
+                    // Check if ALL of successor's predecessors (ins) are retired
+                    boolean allPredecessorsRetired = true;
+                    for (Node pred : successor.ins) {
+                        if (pred.status != Status.RETIRED) {
+                            allPredecessorsRetired = false;
+                            break;
+                        }
+                    }
+
+                    if (allPredecessorsRetired) {
+                        successor.status = Status.READY;
+                        ready.offer(new NodeWithIndex(successor, nodeIndex.get(successor)));
+                    }
                 }
             }
 
             // schedule up to two ops this cycle
             Node slot1 = null, slot2 = null;
             List<NodeWithIndex> skipped = new ArrayList<>();
-            boolean slot2Blocked = false; // e.g., when output occupies cycle
-            while (ready.size() > 0 && (slot1 == null || slot2 == null) && !(slot1 != null && slot2 != null)) {
+
+            while (!ready.isEmpty() && (slot1 == null || slot2 == null)) {
                 NodeWithIndex nw = ready.poll();
                 Node node = nw.node;
                 Opcode opc = node.op.getOpCode();
-                int nodeLatency = node.latency;
 
                 boolean placed = false;
+
+                // Check if we can place this operation given what's already scheduled
+                // Slot 1 (f1): memory ops (load/store) or any op
+                // Slot 2 (f2): mult or non-memory ALU ops (add, sub, shift, loadI)
                 if (opc == Opcode.output) {
-                    if (slot1 == null) { slot1 = node; placed = true; slot2Blocked = true; }
-                } else if (opc == Opcode.mult) {
-                    if (slot2 == null && !slot2Blocked) { slot2 = node; placed = true; }
-                    else if (slot1 == null) { slot1 = node; placed = true; }
+                    // Output takes the entire cycle - can only be in slot1, blocks both slots
+                    if (slot1 == null && slot2 == null) {
+                        slot1 = node;
+                        placed = true;
+                    }
                 } else if (opc == Opcode.load || opc == Opcode.store) {
-                    // prefer slot1 for memory ops, but allow slot2 if slot1 taken and not blocked
-                    if (slot1 == null) { slot1 = node; placed = true; }
-                    else if (slot2 == null && !slot2Blocked) { slot2 = node; placed = true; }
+                    // Memory ops can ONLY go in slot1
+                    if (slot1 == null) {
+                        slot1 = node;
+                        placed = true;
+                    }
+                } else if (opc == Opcode.mult) {
+                    // Mult can ONLY go in slot2
+                    if (slot2 == null) {
+                        slot2 = node;
+                        placed = true;
+                    }
                 } else {
-                    // other ops prefer slot2
-                    if (slot2 == null && !slot2Blocked) { slot2 = node; placed = true; }
-                    else if (slot1 == null) { slot1 = node; placed = true; }
+                    // Regular ALU ops (add, sub, shift, loadI)
+                    // Can go in either slot - try slot2 first, then slot1
+                    if (slot2 == null) {
+                        slot2 = node;
+                        placed = true;
+                    } else if (slot1 == null) {
+                        slot1 = node;
+                        placed = true;
+                    }
                 }
 
-                if (!placed) {
+                if (placed) {
+                    // place node: add to active list to be retired after latency
+                    int removeCycle = cycle + node.latency;
+                    active.computeIfAbsent(removeCycle, k -> new ArrayList<>()).add(node);
+                    node.status = Status.ACTIVE;
+                } else {
                     skipped.add(nw);
-                    continue;
                 }
-
-                // place node: add to active list to be retired after latency
-                int removeCycle = cycle + nodeLatency;
-                active.computeIfAbsent(removeCycle, k -> new ArrayList<>()).add(node);
-                node.status = Status.ACTIVE;
             }
 
             // push skipped back
