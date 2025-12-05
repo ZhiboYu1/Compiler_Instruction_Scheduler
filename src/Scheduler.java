@@ -234,65 +234,56 @@ public class Scheduler {
             if (active.containsKey(cycle)) active.remove(cycle);
 
             // Check if operations can become ready
-            // Check successors of retired operations
+            // Collect all nodes that might be ready (successors of retired or active nodes)
+            Set<Node> candidatesForReady = new HashSet<>();
+
+            // Add successors of retired operations
             for (Node retired : retiring) {
                 for (Edge outEdge : retired.outs) {
-                    Node successor = outEdge.target;
-                    if (successor.status != Status.NOT_READY) continue;
-
-                    // Check if ALL of successor's predecessors are satisfied
-                    boolean allDependenciesSatisfied = true;
-                    for (Edge inEdge : successor.ins) {
-                        Node pred = inEdge.target;
-                        if (pred.status == Status.NOT_READY) {
-                            allDependenciesSatisfied = false;
-                            break;
-                        }
-
-                        if (inEdge.type == EdgeType.SERIALIZATION) {
-                            // SERIALIZATION edges have latency 1: can issue 1 cycle after pred issues
-                            // So pred must have issued in a previous cycle (issueCycle < current cycle)
-                            if (pred.status == Status.ACTIVE && pred.issueCycle >= cycle) {
-                                allDependenciesSatisfied = false;
-                                break;
-                            }
-                        } else {
-                            // FLOW and CONFLICT edges: must wait for RETIRED
-                            if (pred.status != Status.RETIRED) {
-                                allDependenciesSatisfied = false;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (allDependenciesSatisfied) {
-                        successor.status = Status.READY;
-                        ready.offer(new NodeWithIndex(successor, nodeIndex.get(successor)));
+                    if (outEdge.target.status == Status.NOT_READY) {
+                        candidatesForReady.add(outEdge.target);
                     }
                 }
             }
 
-            // Also check all NOT_READY nodes to see if their serialization dependencies are satisfied
-            // This handles early release for operations with serial edges to active operations
-            for (Node node : nodes) {
-                if (node.status != Status.NOT_READY) continue;
+            // Add successors of active operations (for early release via serialization edges)
+            for (List<Node> activeOps : active.values()) {
+                for (Node activeNode : activeOps) {
+                    for (Edge outEdge : activeNode.outs) {
+                        if (outEdge.type == EdgeType.SERIALIZATION &&
+                            outEdge.target.status == Status.NOT_READY) {
+                            candidatesForReady.add(outEdge.target);
+                        }
+                    }
+                }
+            }
 
+            // Check each candidate to see if all dependencies are satisfied
+            for (Node candidate : candidatesForReady) {
                 boolean allDependenciesSatisfied = true;
-                for (Edge inEdge : node.ins) {
+
+                for (Edge inEdge : candidate.ins) {
                     Node pred = inEdge.target;
+
                     if (pred.status == Status.NOT_READY) {
                         allDependenciesSatisfied = false;
                         break;
                     }
 
                     if (inEdge.type == EdgeType.SERIALIZATION) {
-                        // SERIALIZATION: can issue 1 cycle after pred issues
-                        if (pred.status == Status.ACTIVE && pred.issueCycle >= cycle) {
-                            allDependenciesSatisfied = false;
-                            break;
+                        // SERIALIZATION edges: can issue 1 cycle after pred issues
+                        // pred must be ACTIVE with issueCycle < cycle, or RETIRED
+                        if (pred.status == Status.ACTIVE) {
+                            if (pred.issueCycle >= cycle) {
+                                // Issued in current cycle, must wait
+                                allDependenciesSatisfied = false;
+                                break;
+                            }
+                            // else: issued in previous cycle, dependency satisfied
                         }
+                        // if RETIRED, dependency satisfied
                     } else {
-                        // FLOW and CONFLICT: must wait for RETIRED
+                        // FLOW and CONFLICT edges: must wait for RETIRED
                         if (pred.status != Status.RETIRED) {
                             allDependenciesSatisfied = false;
                             break;
@@ -301,8 +292,8 @@ public class Scheduler {
                 }
 
                 if (allDependenciesSatisfied) {
-                    node.status = Status.READY;
-                    ready.offer(new NodeWithIndex(node, nodeIndex.get(node)));
+                    candidate.status = Status.READY;
+                    ready.offer(new NodeWithIndex(candidate, nodeIndex.get(candidate)));
                 }
             }
 
@@ -396,15 +387,26 @@ public class Scheduler {
     }
 
     private Integer getMemoryAddressConstant(OpRecord op) {
-        // return SR if the memory address operand is a constant (load: operand1.SR, store: operand3.SR)
+        // Return the constant address value ONLY if the address is a known constant
+        // Returns null if address is in a register (unknown at compile time)
         if (op == null) return null;
         Opcode opc = op.getOpCode();
         if (opc == Opcode.load) {
             Operand a1 = op.getOperand1();
-            if (a1 != null) return a1.getSR();
+            // For load, operand1 should be a register containing the address
+            // We can't determine the constant address at compile time
+            return null;
         } else if (opc == Opcode.store) {
             Operand a3 = op.getOperand3();
-            if (a3 != null) return a3.getSR();
+            // For store, operand3 should be a register containing the address
+            // We can't determine the constant address at compile time
+            return null;
+        } else if (opc == Opcode.output) {
+            // Output uses a constant value directly
+            Operand a1 = op.getOperand1();
+            if (a1 != null && !a1.isRegister()) {
+                return a1.getSR();
+            }
         }
         return null;
     }
