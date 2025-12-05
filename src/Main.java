@@ -11,7 +11,8 @@ public class Main {
             if (args[0].equals("-h")){
                 printCommandDescription();
             } else {
-                scanParseFile(args[0], false, false, false, false, -1, false);
+                // Default: run scheduler and print scheduled output
+                scanParseFile(args[0], false, false, false, false, -1, true);
             }
         } else if (args.length == 2){
             try {
@@ -67,7 +68,7 @@ public class Main {
                 } else if (schedule) {
                     parser.parseRenameAndSchedule();
                 } else {
-                    parser.parse();
+                    parser.parseAndPrintIR();
                 }
             } else {
                 Scanner scanner = new Scanner(toBeParsedFile);
@@ -90,6 +91,7 @@ public class Main {
         System.out.println("  -r <filename>\t Read the specified file, scan it, parse it, and print the intermediate representation.");
         System.out.println("  -x <filename>\t scans and parse the input block. It should then perform renaming the code in the input block and print the results to the standard output stream.");
         System.out.println("  <int k> <filename>\t  scans and parse the input block. It should then perform renaming, then allocating with the inputted integer representing the number of reserved registers. It then prints the results of the register allocation to the standard output stream.");
+        System.out.println("  <name> schedule <name> will be used to invoke schedule on the input block contained in <name> (schedule is the name of the executable). <name> specifics the name of the input file. <name> is a valid Linux pathname relative to the current working directory. shcedule will produce, as output, an ILOC program that is equivalent to the input program, albeit reordered to improve its execution time on the Lab3 ILOC Simulator. The output code must use the square bracket notation [op1;op2] to designate operations that should issue in the same cycle. schedule is not required to process command-line arguments that appear after <file name>.");
         // System.out.println(
         //         "Supported command flags:\n" +
         //         "412alloc –h produce a list of valid command-line arguments that " +
