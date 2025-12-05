@@ -80,52 +80,68 @@ public class Scheduler {
         }
 
         int n = ops.size();
-        for (int i = 0; i < n; i++) {
-            nodeOf.get(ops.get(i));
-        }
+
+        // Track the LAST definition of each register (for more precise dependencies)
+        Map<Integer, Integer> lastDef = new HashMap<>(); // register -> operation index
 
         // Create dependency edges
+        for (int i = 0; i < n; i++) {
+            Node curNode = nodeOf.get(ops.get(i));
+            Set<Integer> curUses = uses.get(i);
+            Set<Integer> curDefs = defs.get(i);
+
+            // RAW: For each register this operation uses, depend on its last definition
+            for (Integer reg : curUses) {
+                if (lastDef.containsKey(reg)) {
+                    int defIdx = lastDef.get(reg);
+                    Node defNode = nodeOf.get(ops.get(defIdx));
+                    defNode.outs.add(curNode);
+                    curNode.ins.add(defNode);
+                }
+            }
+
+            // WAW: For each register this operation defines, depend on its previous definition
+            for (Integer reg : curDefs) {
+                if (lastDef.containsKey(reg)) {
+                    int prevDefIdx = lastDef.get(reg);
+                    Node prevDefNode = nodeOf.get(ops.get(prevDefIdx));
+                    prevDefNode.outs.add(curNode);
+                    curNode.ins.add(prevDefNode);
+                }
+                // Update last definition
+                lastDef.put(reg, i);
+            }
+        }
+
+        // Add memory dependencies separately
         for (int j = 0; j < n; j++) {
             for (int i = j + 1; i < n; i++) {
                 boolean dep = false;
-                Set<Integer> defj = defs.get(j);
-                Set<Integer> usei = uses.get(i);
 
-                // RAW (Read-After-Write): j defines a register that i uses
-                for (Integer d : defj) {
-                    if (usei.contains(d)) {
+                // memory dependence handling: be conservative for stores, but allow
+                // load-load reordering when there is no intervening store.
+                Opcode opj = ops.get(j).getOpCode();
+                Opcode opi = ops.get(i).getOpCode();
+                if (opj == Opcode.load && opi == Opcode.load) {
+                    // if no store occurs between j and i, allow reordering of loads
+                    boolean storeBetween = false;
+                    for (int k = j+1; k < i; k++) {
+                        Opcode ok = ops.get(k).getOpCode();
+                        if (ok == Opcode.store) { storeBetween = true; break; }
+                    }
+                    if (storeBetween) dep = true; // conservative if a store exists in between
+                } else if (opj == Opcode.load || opj == Opcode.store || opi == Opcode.load || opi == Opcode.store) {
+                    // For pairs involving a store, require serialization unless both addresses are constant and different
+                    Integer addrJ = getMemoryAddressConstant(ops.get(j));
+                    Integer addrI = getMemoryAddressConstant(ops.get(i));
+                    if (addrJ != null && addrI != null && !addrJ.equals(addrI)) {
+                        // different constant addresses -> no dependency
+                        dep = false;
+                    } else {
                         dep = true;
-                        break;
                     }
                 }
 
-                // Note: We skip WAW and WAR dependencies when using SRs (unrenamed code)
-                // because in-order issue automatically handles them
-                if (!dep) {
-                    // memory dependence handling: be conservative for stores, but allow
-                    // load-load reordering when there is no intervening store.
-                    Opcode opj = ops.get(j).getOpCode();
-                    Opcode opi = ops.get(i).getOpCode();
-                    if (opj == Opcode.load && opi == Opcode.load) {
-                        // if no store occurs between j and i, allow reordering of loads
-                        boolean storeBetween = false;
-                        for (int k = j+1; k < i; k++) {
-                            Opcode ok = ops.get(k).getOpCode();
-                            if (ok == Opcode.store) { storeBetween = true; break; }
-                        }
-                        if (storeBetween) dep = true; // conservative if a store exists in between
-                    } else if (opj == Opcode.load || opj == Opcode.store || opi == Opcode.load || opi == Opcode.store) {
-                        // For pairs involving a store, require serialization unless both addresses are constant and different
-                        Integer addrJ = getMemoryAddressConstant(ops.get(j));
-                        Integer addrI = getMemoryAddressConstant(ops.get(i));
-                        if (addrJ != null && addrI != null && !addrJ.equals(addrI)) {
-                            // different constant addresses -> no dependency
-                            dep = false;
-                        } else {
-                            dep = true;
-                        }
-                    }
-                }
                 if (dep) {
                     // Standard forward edges: j (earlier) -> i (later)
                     // ins = predecessors that must complete first
