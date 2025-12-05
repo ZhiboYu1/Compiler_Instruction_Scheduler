@@ -90,10 +90,29 @@ public class Scheduler {
                     for (Integer d : defi) if (defj.contains(d)) { dep = true; break; }
                 }
                 if (!dep) {
-                    // conservative memory serialization for correctness
+                    // memory dependence handling: be conservative for stores, but allow
+                    // load-load reordering when there is no intervening store.
                     Opcode opj = ops.get(j).getOpCode();
                     Opcode opi = ops.get(i).getOpCode();
-                    if (opj == Opcode.load || opj == Opcode.store || opi == Opcode.load || opi == Opcode.store) dep = true;
+                    if (opj == Opcode.load && opi == Opcode.load) {
+                        // if no store occurs between j and i, allow reordering of loads
+                        boolean storeBetween = false;
+                        for (int k = j+1; k < i; k++) {
+                            Opcode ok = ops.get(k).getOpCode();
+                            if (ok == Opcode.store) { storeBetween = true; break; }
+                        }
+                        if (storeBetween) dep = true; // conservative if a store exists in between
+                    } else if (opj == Opcode.load || opj == Opcode.store || opi == Opcode.load || opi == Opcode.store) {
+                        // For pairs involving a store, require serialization unless both addresses are constant and different
+                        Integer addrJ = getMemoryAddressConstant(ops.get(j));
+                        Integer addrI = getMemoryAddressConstant(ops.get(i));
+                        if (addrJ != null && addrI != null && !addrJ.equals(addrI)) {
+                            // different constant addresses -> no dependency
+                            dep = false;
+                        } else {
+                            dep = true;
+                        }
+                    }
                 }
                 if (dep) {
                     Node a = nodeOf.get(ops.get(j));
@@ -125,8 +144,11 @@ public class Scheduler {
         List<String> outLines = new ArrayList<>();
         int cycle = 1;
         Map<Integer, List<Node>> active = new HashMap<>(); // removalCycle -> nodes
-        int busy1Until = 0, busy2Until = 0;
         int scheduledCount = 0;
+
+        // mapping node -> original index for stable tie-breaks
+        Map<Node, Integer> nodeIndex = new HashMap<>();
+        for (int i = 0; i < nodes.size(); i++) nodeIndex.put(nodes.get(i), i);
 
         while (!ready.isEmpty() || !active.isEmpty()) {
             // retire nodes whose removal cycle == cycle
@@ -146,11 +168,11 @@ public class Scheduler {
                 }
             }
 
-            // schedule up to two ops this cycle respecting resource busy-until
+            // schedule up to two ops this cycle
             Node slot1 = null, slot2 = null;
             List<NodeWithIndex> skipped = new ArrayList<>();
-
-            while (ready.size() > 0 && (slot1 == null || slot2 == null)) {
+            boolean slot2Blocked = false; // e.g., when output occupies cycle
+            while (ready.size() > 0 && (slot1 == null || slot2 == null) && !(slot1 != null && slot2 != null)) {
                 NodeWithIndex nw = ready.poll();
                 Node node = nw.node;
                 Opcode opc = node.op.getOpCode();
@@ -158,15 +180,18 @@ public class Scheduler {
 
                 boolean placed = false;
                 if (opc == Opcode.output) {
-                    if (slot1 == null && busy1Until <= cycle) { slot1 = node; placed = true; }
+                    if (slot1 == null) { slot1 = node; placed = true; slot2Blocked = true; }
                 } else if (opc == Opcode.mult) {
-                    if (slot2 == null && busy2Until <= cycle) { slot2 = node; placed = true; }
+                    if (slot2 == null && !slot2Blocked) { slot2 = node; placed = true; }
+                    else if (slot1 == null) { slot1 = node; placed = true; }
                 } else if (opc == Opcode.load || opc == Opcode.store) {
-                    if (slot1 == null && busy1Until <= cycle) { slot1 = node; placed = true; }
+                    // prefer slot1 for memory ops, but allow slot2 if slot1 taken and not blocked
+                    if (slot1 == null) { slot1 = node; placed = true; }
+                    else if (slot2 == null && !slot2Blocked) { slot2 = node; placed = true; }
                 } else {
                     // other ops prefer slot2
-                    if (slot2 == null && busy2Until <= cycle) { slot2 = node; placed = true; }
-                    else if (slot1 == null && busy1Until <= cycle) { slot1 = node; placed = true; }
+                    if (slot2 == null && !slot2Blocked) { slot2 = node; placed = true; }
+                    else if (slot1 == null) { slot1 = node; placed = true; }
                 }
 
                 if (!placed) {
@@ -174,12 +199,10 @@ public class Scheduler {
                     continue;
                 }
 
-                // place node: set busyUntil and add to active
+                // place node: add to active list to be retired after latency
                 int removeCycle = cycle + nodeLatency;
                 active.computeIfAbsent(removeCycle, k -> new ArrayList<>()).add(node);
                 node.status = Status.ACTIVE;
-                if (slot1 == node) busy1Until = removeCycle;
-                if (slot2 == node) busy2Until = removeCycle;
             }
 
             // push skipped back
@@ -214,6 +237,20 @@ public class Scheduler {
             case mult: return 3;
             case add: case sub: case lshift: case rshift: case loadI: case output: case nop: default: return 1;
         }
+    }
+
+    private Integer getMemoryAddressConstant(OpRecord op) {
+        // return SR if the memory address operand is a constant (load: operand1.SR, store: operand3.SR)
+        if (op == null) return null;
+        Opcode opc = op.getOpCode();
+        if (opc == Opcode.load) {
+            Operand a1 = op.getOperand1();
+            if (a1 != null) return a1.getSR();
+        } else if (opc == Opcode.store) {
+            Operand a3 = op.getOperand3();
+            if (a3 != null) return a3.getSR();
+        }
+        return null;
     }
 
     private List<OpRecord> collectOps() {
