@@ -42,6 +42,7 @@ public class Scheduler {
         int latency = 1; // intrinsic latency
         int totalLatency = -1; // priority
         Status status = Status.NOT_READY;
+        int issueCycle = -1; // cycle when operation was issued
         public Node(OpRecord op) { this.op = op; }
     }
 
@@ -232,15 +233,14 @@ public class Scheduler {
             }
             if (active.containsKey(cycle)) active.remove(cycle);
 
-            // Check if operations that depend on retired ops can become ready
+            // Check if operations can become ready
+            // Check successors of retired operations
             for (Node retired : retiring) {
                 for (Edge outEdge : retired.outs) {
                     Node successor = outEdge.target;
                     if (successor.status != Status.NOT_READY) continue;
 
                     // Check if ALL of successor's predecessors are satisfied
-                    // FLOW and CONFLICT edges: wait for RETIRED
-                    // SERIALIZATION edges: satisfied when operation issues (1 cycle)
                     boolean allDependenciesSatisfied = true;
                     for (Edge inEdge : successor.ins) {
                         Node pred = inEdge.target;
@@ -248,13 +248,21 @@ public class Scheduler {
                             allDependenciesSatisfied = false;
                             break;
                         }
-                        // For FLOW and CONFLICT edges, must wait for RETIRED
-                        if ((inEdge.type == EdgeType.FLOW || inEdge.type == EdgeType.CONFLICT) &&
-                            pred.status != Status.RETIRED) {
-                            allDependenciesSatisfied = false;
-                            break;
+
+                        if (inEdge.type == EdgeType.SERIALIZATION) {
+                            // SERIALIZATION edges have latency 1: can issue 1 cycle after pred issues
+                            // So pred must have issued in a previous cycle (issueCycle < current cycle)
+                            if (pred.status == Status.ACTIVE && pred.issueCycle >= cycle) {
+                                allDependenciesSatisfied = false;
+                                break;
+                            }
+                        } else {
+                            // FLOW and CONFLICT edges: must wait for RETIRED
+                            if (pred.status != Status.RETIRED) {
+                                allDependenciesSatisfied = false;
+                                break;
+                            }
                         }
-                        // For SERIALIZATION edges, ACTIVE or RETIRED is sufficient (early release)
                     }
 
                     if (allDependenciesSatisfied) {
@@ -264,42 +272,37 @@ public class Scheduler {
                 }
             }
 
-            // EARLY RELEASE: Check for operations with serialization dependencies on ACTIVE operations
-            // This implements Step 4 from the scheduling algorithm
-            for (List<Node> activeOps : active.values()) {
-                for (Node activeNode : activeOps) {
-                    // Only memory ops can have serial successors
-                    Opcode opc = activeNode.op.getOpCode();
-                    if (opc != Opcode.load && opc != Opcode.store && opc != Opcode.output) continue;
+            // Also check all NOT_READY nodes to see if their serialization dependencies are satisfied
+            // This handles early release for operations with serial edges to active operations
+            for (Node node : nodes) {
+                if (node.status != Status.NOT_READY) continue;
 
-                    for (Edge outEdge : activeNode.outs) {
-                        if (outEdge.type != EdgeType.SERIALIZATION) continue;
+                boolean allDependenciesSatisfied = true;
+                for (Edge inEdge : node.ins) {
+                    Node pred = inEdge.target;
+                    if (pred.status == Status.NOT_READY) {
+                        allDependenciesSatisfied = false;
+                        break;
+                    }
 
-                        Node successor = outEdge.target;
-                        if (successor.status != Status.NOT_READY) continue;
-
-                        // Check if ALL other dependencies are satisfied
-                        boolean allOtherDependenciesSatisfied = true;
-                        for (Edge inEdge : successor.ins) {
-                            Node pred = inEdge.target;
-                            if (pred == activeNode) continue; // Skip the serial edge we're releasing
-
-                            if (pred.status == Status.NOT_READY) {
-                                allOtherDependenciesSatisfied = false;
-                                break;
-                            }
-                            if ((inEdge.type == EdgeType.FLOW || inEdge.type == EdgeType.CONFLICT) &&
-                                pred.status != Status.RETIRED) {
-                                allOtherDependenciesSatisfied = false;
-                                break;
-                            }
+                    if (inEdge.type == EdgeType.SERIALIZATION) {
+                        // SERIALIZATION: can issue 1 cycle after pred issues
+                        if (pred.status == Status.ACTIVE && pred.issueCycle >= cycle) {
+                            allDependenciesSatisfied = false;
+                            break;
                         }
-
-                        if (allOtherDependenciesSatisfied) {
-                            successor.status = Status.READY;
-                            ready.offer(new NodeWithIndex(successor, nodeIndex.get(successor)));
+                    } else {
+                        // FLOW and CONFLICT: must wait for RETIRED
+                        if (pred.status != Status.RETIRED) {
+                            allDependenciesSatisfied = false;
+                            break;
                         }
                     }
+                }
+
+                if (allDependenciesSatisfied) {
+                    node.status = Status.READY;
+                    ready.offer(new NodeWithIndex(node, nodeIndex.get(node)));
                 }
             }
 
@@ -352,6 +355,7 @@ public class Scheduler {
                     int removeCycle = cycle + node.latency;
                     active.computeIfAbsent(removeCycle, k -> new ArrayList<>()).add(node);
                     node.status = Status.ACTIVE;
+                    node.issueCycle = cycle;
                 } else {
                     skipped.add(nw);
                 }
