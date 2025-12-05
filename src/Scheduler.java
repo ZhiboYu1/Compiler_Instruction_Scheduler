@@ -1,11 +1,11 @@
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
-import java.util.Queue;
 import java.util.Set;
 
 import IntermediateRepresentation.OpRecord;
@@ -13,149 +13,44 @@ import IntermediateRepresentation.Operand;
 import Token.Opcode;
 
 /**
- * Conservative two-issue scheduler.
- *
- * This scheduler builds a conservative dependence graph using VR defs/uses and
- * treats memory ops (loads/stores) as serializing with other memory ops.
- * It then issues up to two operations per cycle with simple slot constraints:
- *  - Slot1 (operationOne): load/store preferred here; also other ops if available
- *  - Slot2 (operationTwo): mult only here; other ops allowed if slot2 free
- *  - output: only one per cycle (placed in slot1)
- *
- * NOTE: This is a conservative/simple scheduler meant to provide reasonable
- * instruction reordering for the lab. It does not implement full address
- * dependence reasoning or latency-based prioritization from the reference
- * implementation.
+ * Improved scheduler: builds a dependence graph, computes priorities (total latency),
+ * and schedules using instruction latencies and two-issue constraints.
+ * This is a simplified port of the reference scheduler behavior.
  */
 public class Scheduler {
-    private OpRecord head; // first real OpRecord (not the sentinel head)
+    private OpRecord head;
 
     public Scheduler(OpRecord head) {
         this.head = head;
     }
 
+    private static class Node {
+        OpRecord op;
+        List<Node> outs = new ArrayList<>();
+        List<Node> ins = new ArrayList<>();
+        int latency = 1; // intrinsic latency
+        int totalLatency = -1; // priority
+        Status status = Status.NOT_READY;
+        public Node(OpRecord op) { this.op = op; }
+    }
+
+    private enum Status { NOT_READY, READY, ACTIVE, RETIRED }
+
     public void printSchedule() {
         List<OpRecord> ops = collectOps();
-        if (ops.size() == 0) return;
+        if (ops.isEmpty()) return;
 
-        Map<OpRecord, List<OpRecord>> adj = buildDeps(ops);
-        Map<OpRecord, Integer> indeg = new HashMap<>();
-        for (OpRecord op : ops) indeg.put(op, 0);
-        for (OpRecord u : adj.keySet()) {
-            for (OpRecord v : adj.get(u)) {
-                indeg.put(v, indeg.get(v) + 1);
-            }
+        // build nodes and adjacency based on VR defs/uses (conservative)
+        Map<OpRecord, Node> nodeOf = new HashMap<>();
+        List<Node> nodes = new ArrayList<>();
+        for (OpRecord op : ops) {
+            Node n = new Node(op);
+            n.latency = computeLatency(op.getOpCode());
+            nodeOf.put(op, n);
+            nodes.add(n);
         }
 
-        // ready queue: preserve original order by using the op's index (position)
-        PriorityQueue<OpWithIndex> ready = new PriorityQueue<>((a,b) -> Integer.compare(a.idx, b.idx));
-        for (int i = 0; i < ops.size(); i++) {
-            OpRecord op = ops.get(i);
-            if (indeg.get(op) == 0) ready.offer(new OpWithIndex(op, i));
-        }
-
-        List<String> scheduleLines = new ArrayList<>();
-        int scheduledCount = 0;
-        // simple scheduler loop
-        while (!ready.isEmpty() || scheduledCount < ops.size()) {
-            // build a cycle block (two slots)
-            OpRecord slot1 = null;
-            OpRecord slot2 = null;
-
-            List<OpWithIndex> skipped = new ArrayList<>();
-
-            int issued = 0;
-            while (issued < 2 && !ready.isEmpty()) {
-                OpWithIndex ow = ready.poll();
-                OpRecord op = ow.op;
-                String opcode = op.getOpCode().toString();
-
-                boolean placed = false;
-                switch (opcode) {
-                    case "output":
-                        if (slot1 == null) {
-                            slot1 = op; placed = true; issued = 2; // output consumes the cycle
-                        } else {
-                            skipped.add(ow);
-                        }
-                        break;
-                    case "mult":
-                        if (slot2 == null) { slot2 = op; placed = true; issued++; }
-                        else { skipped.add(ow); }
-                        break;
-                    case "load":
-                    case "store":
-                        if (slot1 == null) { slot1 = op; placed = true; issued++; }
-                        else { skipped.add(ow); }
-                        break;
-                    default:
-                        // any-other op can go in slot2 if free, otherwise slot1
-                        if (slot2 == null) { slot2 = op; placed = true; issued++; }
-                        else if (slot1 == null) { slot1 = op; placed = true; issued++; }
-                        else { skipped.add(ow); }
-                        break;
-                }
-
-                if (!placed) continue;
-            }
-
-            // format line
-            String op1s = slot1 == null ? "nop" : formatOp(slot1);
-            String op2s = slot2 == null ? "nop" : formatOp(slot2);
-            scheduleLines.add(String.format("[ %s ; %s ]", op1s, op2s));
-
-            // mark scheduled and update indegrees
-            List<OpRecord> justScheduled = new ArrayList<>();
-            if (slot1 != null) { justScheduled.add(slot1); scheduledCount++; }
-            if (slot2 != null && slot2 != slot1) { justScheduled.add(slot2); scheduledCount++; }
-
-            for (OpRecord s : justScheduled) {
-                List<OpRecord> neighbors = adj.getOrDefault(s, new ArrayList<>());
-                for (OpRecord v : neighbors) {
-                    indeg.put(v, indeg.get(v) - 1);
-                    if (indeg.get(v) == 0) {
-                        // push with its original index
-                        int idx = ops.indexOf(v);
-                        ready.offer(new OpWithIndex(v, idx));
-                    }
-                }
-            }
-
-            // push skipped back to ready
-            for (OpWithIndex w : skipped) ready.offer(w);
-
-            // safety: if nothing scheduled but ready not empty (due to placement constraints), force one
-            if (justScheduled.size() == 0 && !ready.isEmpty()) {
-                OpWithIndex forced = ready.poll();
-                OpRecord fop = forced.op;
-                scheduleLines.add(String.format("[ %s ; %s ]", formatOp(fop), "nop"));
-                scheduledCount++;
-                List<OpRecord> neighbors = adj.getOrDefault(fop, new ArrayList<>());
-                for (OpRecord v : neighbors) {
-                    indeg.put(v, indeg.get(v) - 1);
-                    if (indeg.get(v) == 0) ready.offer(new OpWithIndex(v, ops.indexOf(v)));
-                }
-            }
-        }
-
-        // print schedule
-        for (String line : scheduleLines) System.out.println(line);
-    }
-
-    private List<OpRecord> collectOps() {
-        List<OpRecord> ops = new ArrayList<>();
-        OpRecord cur = this.head;
-        while (cur != null) {
-            ops.add(cur);
-            cur = cur.getNext();
-        }
-        return ops;
-    }
-
-    private Map<OpRecord, List<OpRecord>> buildDeps(List<OpRecord> ops) {
-        Map<OpRecord, List<OpRecord>> adj = new HashMap<>();
-        int n = ops.size();
-        // precompute defs and uses (VRs)
+        // compute data edges (RAW/WAW/WAR) using VRs
         List<Set<Integer>> defs = new ArrayList<>();
         List<Set<Integer>> uses = new ArrayList<>();
         for (OpRecord op : ops) {
@@ -163,13 +58,11 @@ public class Scheduler {
             Set<Integer> u = new HashSet<>();
             List<Operand> operands = op.getOperands();
             if (operands != null && operands.size() > 0) {
-                // last operand (unless store) is defining register
                 Opcode opc = op.getOpCode();
                 if (opc != Opcode.store) {
                     Operand def = operands.get(operands.size() - 1);
                     if (def != null && def.isRegister()) d.add(def.getVR());
                 }
-                // uses are the remaining operands
                 int upto = operands.size();
                 if (opc != Opcode.store && operands.size() > 0) upto = operands.size() - 1;
                 for (int i = 0; i < upto; i++) {
@@ -180,38 +73,157 @@ public class Scheduler {
             defs.add(d); uses.add(u);
         }
 
-        // conservative memory handling: treat any load/store as serializing with other loads/stores
-        for (int i = 0; i < n; i++) adj.put(ops.get(i), new ArrayList<>());
+        int n = ops.size();
+        for (int i = 0; i < n; i++) {
+            nodeOf.get(ops.get(i));
+        }
+
+        // create edges from earlier to later when dependency detected
         for (int j = 0; j < n; j++) {
-            for (int i = j+1; i < n; i++) {
-                boolean dependent = false;
-                // RAW/WAR/WAW: check defs[j] vs uses[i] or defs[i]
+            for (int i = j + 1; i < n; i++) {
+                boolean dep = false;
                 Set<Integer> defj = defs.get(j);
                 Set<Integer> usei = uses.get(i);
                 Set<Integer> defi = defs.get(i);
-                // RAW
-                for (Integer d : defj) if (usei.contains(d)) { dependent = true; break; }
-                if (!dependent) {
-                    // WAR or WAW
-                    for (Integer d : defi) if (defj.contains(d)) { dependent = true; break; }
+                for (Integer d : defj) if (usei.contains(d)) { dep = true; break; }
+                if (!dep) {
+                    for (Integer d : defi) if (defj.contains(d)) { dep = true; break; }
                 }
-
-                // conservative memory dependence: if either is load/store, serialize
-                Opcode opj = ops.get(j).getOpCode();
-                Opcode opi = ops.get(i).getOpCode();
-                if (!dependent) {
-                    if (opj == Opcode.load || opj == Opcode.store || opi == Opcode.load || opi == Opcode.store) {
-                        dependent = true;
-                    }
+                if (!dep) {
+                    // conservative memory serialization for correctness
+                    Opcode opj = ops.get(j).getOpCode();
+                    Opcode opi = ops.get(i).getOpCode();
+                    if (opj == Opcode.load || opj == Opcode.store || opi == Opcode.load || opi == Opcode.store) dep = true;
                 }
-
-                if (dependent) {
-                    adj.get(ops.get(j)).add(ops.get(i));
+                if (dep) {
+                    Node a = nodeOf.get(ops.get(j));
+                    Node b = nodeOf.get(ops.get(i));
+                    a.outs.add(b);
+                    b.ins.add(a);
                 }
             }
         }
 
-        return adj;
+        // compute priorities (totalLatency) via DFS
+        for (Node nd : nodes) {
+            if (nd.totalLatency == -1) computeTotalLatency(nd);
+        }
+
+        // ready heap: max-heap by totalLatency, tiebreak by original index (stable)
+        PriorityQueue<NodeWithIndex> ready = new PriorityQueue<>((a,b) -> {
+            int c = Integer.compare(b.node.totalLatency, a.node.totalLatency);
+            if (c != 0) return c;
+            return Integer.compare(a.idx, b.idx);
+        });
+        for (int i = 0; i < nodes.size(); i++) {
+            if (nodes.get(i).ins.isEmpty()) {
+                nodes.get(i).status = Status.READY;
+                ready.offer(new NodeWithIndex(nodes.get(i), i));
+            }
+        }
+
+        List<String> outLines = new ArrayList<>();
+        int cycle = 1;
+        Map<Integer, List<Node>> active = new HashMap<>(); // removalCycle -> nodes
+        int busy1Until = 0, busy2Until = 0;
+        int scheduledCount = 0;
+
+        while (!ready.isEmpty() || !active.isEmpty()) {
+            // retire nodes whose removal cycle == cycle
+            List<Node> retiring = active.getOrDefault(cycle, new ArrayList<>());
+            for (Node rn : retiring) {
+                rn.status = Status.RETIRED;
+                scheduledCount++;
+            }
+            if (active.containsKey(cycle)) active.remove(cycle);
+
+            // add newly-ready nodes whose predecessors retired
+            for (Node nd : nodes) {
+                if (nd.status == Status.NOT_READY) {
+                    boolean readyAll = true;
+                    for (Node p : nd.ins) if (p.status != Status.RETIRED) { readyAll = false; break; }
+                    if (readyAll) { nd.status = Status.READY; ready.offer(new NodeWithIndex(nd, nodes.indexOf(nd))); }
+                }
+            }
+
+            // schedule up to two ops this cycle respecting resource busy-until
+            Node slot1 = null, slot2 = null;
+            List<NodeWithIndex> skipped = new ArrayList<>();
+
+            while (ready.size() > 0 && (slot1 == null || slot2 == null)) {
+                NodeWithIndex nw = ready.poll();
+                Node node = nw.node;
+                Opcode opc = node.op.getOpCode();
+                int nodeLatency = node.latency;
+
+                boolean placed = false;
+                if (opc == Opcode.output) {
+                    if (slot1 == null && busy1Until <= cycle) { slot1 = node; placed = true; }
+                } else if (opc == Opcode.mult) {
+                    if (slot2 == null && busy2Until <= cycle) { slot2 = node; placed = true; }
+                } else if (opc == Opcode.load || opc == Opcode.store) {
+                    if (slot1 == null && busy1Until <= cycle) { slot1 = node; placed = true; }
+                } else {
+                    // other ops prefer slot2
+                    if (slot2 == null && busy2Until <= cycle) { slot2 = node; placed = true; }
+                    else if (slot1 == null && busy1Until <= cycle) { slot1 = node; placed = true; }
+                }
+
+                if (!placed) {
+                    skipped.add(nw);
+                    continue;
+                }
+
+                // place node: set busyUntil and add to active
+                int removeCycle = cycle + nodeLatency;
+                active.computeIfAbsent(removeCycle, k -> new ArrayList<>()).add(node);
+                node.status = Status.ACTIVE;
+                if (slot1 == node) busy1Until = removeCycle;
+                if (slot2 == node) busy2Until = removeCycle;
+            }
+
+            // push skipped back
+            for (NodeWithIndex s : skipped) ready.offer(s);
+
+            String s1 = slot1 == null ? "nop" : formatOp(slot1.op);
+            String s2 = slot2 == null ? "nop" : formatOp(slot2.op);
+            outLines.add(String.format("[ %s ; %s ]", s1, s2));
+
+            cycle++;
+            // safety: avoid infinite loop
+            if (cycle > 100000) break;
+        }
+
+        for (String l : outLines) System.out.println(l);
+    }
+
+    private int computeTotalLatency(Node n) {
+        if (n.totalLatency != -1) return n.totalLatency;
+        int maxChild = 0;
+        for (Node c : n.outs) {
+            int v = computeTotalLatency(c);
+            if (v > maxChild) maxChild = v;
+        }
+        n.totalLatency = n.latency + maxChild;
+        return n.totalLatency;
+    }
+
+    private int computeLatency(Opcode op) {
+        switch (op) {
+            case load: case store: return 6;
+            case mult: return 3;
+            case add: case sub: case lshift: case rshift: case loadI: case output: case nop: default: return 1;
+        }
+    }
+
+    private List<OpRecord> collectOps() {
+        List<OpRecord> ops = new ArrayList<>();
+        OpRecord cur = this.head;
+        while (cur != null) {
+            ops.add(cur);
+            cur = cur.getNext();
+        }
+        return ops;
     }
 
     private String formatOp(OpRecord curOp) {
@@ -249,9 +261,7 @@ public class Scheduler {
         }
     }
 
-    private static class OpWithIndex {
-        public OpRecord op;
-        public int idx;
-        public OpWithIndex(OpRecord o, int i) { this.op = o; this.idx = i; }
+    private static class NodeWithIndex {
+        Node node; int idx; NodeWithIndex(Node n, int i){ node=n; idx=i; }
     }
 }
